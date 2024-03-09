@@ -1,0 +1,251 @@
+#############################
+### Import data from FRED ###
+#############################
+
+# FRED import data
+install.packages("quantmod")
+library(quantmod)
+
+getSymbols("UNRATE", src = "FRED") # unemployment rate from FRED
+getSymbols("CPIAUCSL", src = "FRED") # inflation rate from FRED
+getSymbols("FEDFUNDS", src = "FRED") # Federal Funds Rate
+getSymbols("GDPC1", src = "FRED") # Real Gross Domestic Product
+getSymbols("GDPPOT", src = "FRED") # Potential GDP
+
+# Convert them to data frames
+unempr <- data.frame(date = index(UNRATE), UNRATE = coredata(UNRATE))
+cpi <- data.frame(date = index(CPIAUCSL), CPIAUCSL = coredata(CPIAUCSL))
+fedr <- data.frame(date = index(FEDFUNDS), FEDFUNDS = coredata(FEDFUNDS))
+gdpr <- data.frame(date = index(GDPC1), GDPC1 = coredata(GDPC1))
+gdpp <- data.frame(date = index(GDPPOT), GDPPOT = coredata(GDPPOT))
+
+rm(UNRATE, CPIAUCSL, FEDFUNDS, GDPC1, GDPPOT)
+
+#############################################
+### Data Transformation And Interpolation ###
+#############################################
+
+# Data transformations
+install.packages("dplyr")
+install.packages("lubridate")
+library(dplyr)
+library(lubridate)
+
+# Generate the quarterly inflation rate using CPI
+cpi <- cpi %>%
+  mutate(inflr = (CPIAUCSL / lag(CPIAUCSL, n = 3) - 1) * 100) # calculates the quarterly inflation rate
+inflr <- cpi %>% select(date, inflr) # select the inflation rate
+
+# Add month and year columns from date
+inflrm <- inflr %>%
+  group_by(year = year(date), month = month(date)) %>%
+  slice(n()) %>%
+  ungroup()
+
+# Add columns months and years to each data frame
+unempr <- unempr %>%
+  mutate(year = year(date), month = month(date))
+inflrm <- inflrm %>%
+  mutate(year = year(date), month = month(date))
+fedr <- fedr %>%
+  mutate(year = year(date), month = month(date))
+gdpr <- gdpr %>%
+  mutate(year = year(date), month = month(date))
+gdpp <- gdpp %>%
+  mutate(year = year(date), month = month(date))
+
+# Combine data using month and year
+data4 <- full_join(unempr, inflrm, by = c("year", "month"))
+data4 <- full_join(data4, fedr, by = c("year", "month"))
+data4 <- full_join(data4, gdpr, by = c("year", "month"))
+data4 <- full_join(data4, gdpp, by = c("year", "month"))
+
+# Select needed columns
+data5 <- data4 %>% select(date.x, UNRATE, inflr, FEDFUNDS, GDPC1, GDPPOT)
+
+# Rename columns 
+data5 <- data5 %>% rename(date = date.x, unempr = UNRATE, fedr = FEDFUNDS, gdpr = GDPC1, gdpp = GDPPOT)
+
+# Removing extra rows and cleaning data from NA
+data6 <- na.omit(data5) %>% arrange(date()) # removing NAs
+data6 <- data6 %>% slice(-c(1:2)) # removing rows
+
+# Adding indicators
+data6$gdpgap <- data6$gdpr - data6$gdpp # GDP gap column
+data6$gdpgapr <- data6$gdpgap / data6$gdpp # GDP gap as percent of potential GDP
+data6$inflry <- rollsum(data6$inflr, 4, fill = NA, align = "right") # making inflation rate as a rolling sum of 4 quarters
+data6 <- data6 %>% slice(-c(1:4)) # removing rows
+data7 <- data6 %>% select(date, unempr, inflr, fedr, gdpgapr) # Creating a subset of data for plotting
+
+# Decompose GDP gap rate
+gdpgapr <- data7 %>% select(date, gdpgapr) # Creating a GDP gap rate data frame
+decompose_result <- decompose(ts(gdpgapr$gdpgapr, frequency = 4))
+plot(decompose_result)
+
+#####################
+### Plotting Data ###
+#####################
+
+install.packages("ggplot2")
+install.packages("tidyr")
+library(ggplot2)
+library(tidyr)
+
+# Plotting data7
+cols <- c("#D43F3A", "#EEA236", "#5CB85C", "#46B8DA")
+data7_long <- pivot_longer(data7, cols = -date, names_to = "Series", values_to = "Value")
+ggplot(data7_long, aes(x = date, y = Value, color = Series)) +
+  geom_line() +
+  labs(x = "Date in Quarter", y = "Values in Percent", title = "U.S. Quarterly Unemployment, Inflation, Fed Interest Rate and GDP gap") +
+  scale_color_manual(values = cols)
+
+#############################
+### The Taylor Rule Model ###
+#############################
+
+# i = r* + π + 0.5(π - π*) + 0.5(y - y*)
+# i is the nominal interest rate
+# r* is the real equilibrium federal funds rate
+# π is the rate of inflation over the previous four quarters
+# π* is the desired rate of inflation
+# y is the logarithm of real GDP
+# y* is the logarithm of potential output
+
+# The Taylor Rule Model Transformed For Inflation #
+# i=r∗+1.5π−0.5π∗+0.5(y−y∗)
+# i−r∗+0.5π∗−0.5(y−y∗)=1.5π
+# π=(i−r∗+0.5π∗−0.5(y−y∗))/1.5
+
+# Constants or known values
+# r_star <- 2        # Real equilibrium federal funds rate
+# pi_star <- 2         # Target rate of inflation
+# i <- data6$fedr        # Nominal interest rate from your data
+# y <- log(data6$gdpr)     # Actual log GDP from your data
+# y_star <- log(data6$gdpp)  # Potential log GDP from your data
+
+# Taylor Rule Model to calculate inflation rate
+# pi <- (i - r_star + 0.5 * pi_star - 0.5 * (y - y_star)) / 1.5
+
+#########################################################
+### Monte Carlo Simulation With The Taylor Rule Model ###
+#########################################################
+
+# Taylor Rule rearranged for inflation
+calculate_inflation <- function(i, r_star, pi_star, y, y_star) {
+  pi <- (i - r_star + 0.5 * pi_star - 0.5 * (y - y_star)) / 1.5
+  return(pi)
+}
+
+# Monte Carlo Simulation
+monte_carlo_simulation <- function(iterations, r_star, pi_star, y, y_star) {
+  # Vectors to store simulation results
+  simulated_inflation_rates <- numeric(iterations)
+  
+  for (i in 1:iterations) {
+    # Simulate the input values, assuming some distributions
+    simulated_i <- rnorm(1, mean = mean(data6$fedr), sd = sd(data6$fedr)) # Nominal interest rate
+    simulated_y <- rnorm(1, mean = mean(log(data6$gdpr)), sd = sd(log(data6$gdpr))) # Based on real GDP
+    simulated_y_star <- rnorm(1, mean = mean(log(data6$gdpp)), sd = sd(log(data6$gdpp))) # Based on GDP potential
+    
+    # Calculate the inflation using the Taylor Rule formula
+    simulated_inflation_rates[i] <- calculate_inflation(simulated_i, r_star, pi_star, simulated_y, simulated_y_star)
+  }
+  
+  return(simulated_inflation_rates)
+}
+
+# Constants for the Taylor Rule
+r_star <- 2  # Real equilibrium federal funds rate
+pi_star <- 2  # Target rate of inflation
+
+# Run the Monte Carlo Simulation with 10000 iterations
+set.seed(2) # Setting seed for reproducibility
+simulation_results <- monte_carlo_simulation(10000, r_star, pi_star, 10000, 10000)
+
+# Analyzing the results
+hist(simulation_results, main = "Simulated Inflation Rates (pi)", xlab = "Simulated Results", breaks = 50)
+summary(simulation_results)
+#   Min.   1st Qu. Median   Mean   3rd Qu.  Max. 
+# -7.1081  0.7453  2.4638  2.4488  4.1203  11.8532
+
+# Monte Carlo confidence level for both tails at 10%, or 5% on each side
+pi_mc_confidence_level <- 0.1
+
+# Monte Carlo VaR for both tails
+pi_mc_lower_tail_VaR <- quantile(simulation_results, pi_mc_confidence_level / 2)
+print(pi_mc_lower_tail_VaR) # -1.585595
+pi_mc_upper_tail_VaR <- quantile(simulation_results, 1 - pi_mc_confidence_level / 2)
+print(pi_mc_upper_tail_VaR) # 6.538091
+
+# Monte Carlo CVaR for both tails
+pi_mc_lower_tail_CVaR <- mean(simulation_results[simulation_results < pi_mc_lower_tail_VaR])
+print(pi_mc_lower_tail_CVaR) # -2.594365
+pi_mc_upper_tail_CVaR <- mean(simulation_results[simulation_results > pi_mc_upper_tail_VaR])
+print(pi_mc_upper_tail_CVaR) # 7.557499
+
+##################################################################
+### Monte Carlo Stressed Simulation With The Taylor Rule Model ###
+##################################################################
+
+# Taylor Rule rearranged for inflation
+calculate_inflation <- function(i, r_star, pi_star, y, y_star) {
+  pi <- (i - r_star + 0.5 * pi_star - 0.5 * (y - y_star)) / 1.5
+  return(pi)
+}
+
+# Stressed Monte Carlo Simulation
+stress_monte_carlo_simulation <- function(iterations, r_star, pi_star, y, y_star) {
+  # Vectors to store simulation results
+  simulated_inflation_rates <- numeric(iterations)
+  
+  for (i in 1:iterations) {
+    # Simulate the input values, assuming some distributions
+    simulated_i <- rnorm(1, mean = mean(data6$fedr), sd = sd(data6$fedr)) # Nominal interest rate
+    simulated_y <- rnorm(1, mean = mean(log(data6$gdpr)/2), sd = sd(log(data6$gdpr)*2)) # Stressed real GDP mean (divided by 2) and sd (multiplied by 2)
+    simulated_y_star <- rnorm(1, mean = mean(log(data6$gdpp)), sd = sd(log(data6$gdpp))) # Based on GDP potential
+    
+    # Calculate the inflation using the Taylor Rule formula
+    simulated_inflation_rates[i] <- calculate_inflation(simulated_i, r_star, pi_star, simulated_y, simulated_y_star)
+  }
+  
+  return(simulated_inflation_rates)
+}
+
+# Constants for the Taylor Rule
+r_star <- 2  # Real equilibrium federal funds rate
+pi_star <- 2  # Target rate of inflation
+
+# Run the Stressed Monte Carlo Simulation with 10000 iterations
+set.seed(2) # Setting seed for reproducibility
+stress_simulation_results <- stress_monte_carlo_simulation(10000, r_star, pi_star, 10000, 10000)
+
+# Analyzing the stressed results
+hist(stress_simulation_results, main = "Stressed Inflation Rates (pi)", xlab = "Simulated Results", breaks = 50)
+summary(stress_simulation_results)
+#   Min.   1st Qu. Median   Mean   3rd Qu.  Max. 
+# -5.539   2.240   3.977   3.971   5.645   13.562
+
+# Monte Carlo confidence level for both tails at 10%, or 5% on each side
+st_pi_mc_confidence_level <- 0.1
+
+# Monte Carlo VaR for both tails
+st_pi_mc_lower_tail_VaR <- quantile(stress_simulation_results, st_pi_mc_confidence_level / 2)
+print(st_pi_mc_lower_tail_VaR) # -0.07993723
+st_pi_mc_upper_tail_VaR <- quantile(stress_simulation_results, 1 - st_pi_mc_confidence_level / 2)
+print(st_pi_mc_upper_tail_VaR) # 8.121231
+
+# Monte Carlo CVaR for both tails
+st_pi_mc_lower_tail_CVaR <- mean(stress_simulation_results[stress_simulation_results < st_pi_mc_lower_tail_VaR])
+print(st_pi_mc_lower_tail_CVaR) # -1.11578
+st_pi_mc_upper_tail_CVaR <- mean(stress_simulation_results[stress_simulation_results > st_pi_mc_upper_tail_VaR])
+print(st_pi_mc_upper_tail_CVaR) # 9.126899
+
+##################################################################
+### Plotting Simulated And Stressed Data Density Distributions ###
+##################################################################
+
+plot(density(simulation_results), main = "Density Comparison", xlab = "Values", ylab = "Density",
+     col = "blue", lwd = 2, ylim = c(0, 0.2))
+lines(density(stress_simulation_results), col = "red", lwd = 2)
+legend("topleft", legend = c("Taylor Rule MC Simulated Inflation Rate", "Taylor Rule Stressed MC Simulated Inflation Rate"), col = c("blue", "red"), lwd = 2, 
+       cex = 0.8, bty = "n")  # Adjust cex for size, bty for box type, etc.
